@@ -98,16 +98,23 @@ def fetch_list_page(sess, cookies, source_name, page, verify_ssl):
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     rows, seen = [], set()
-    for cell in soup.select(".td_lft"):
+
+    # 제목 + 날짜 같이 추출
+    for tr in soup.select("div#lstTop > table > tbody > tr"):
+        cell = tr.select_one(".td_lft")
+        if not cell:
+            continue
         a = cell.select_one(".linkTxt")
-        if not a: 
+        if not a:
             continue
         idx = extract_idx_from_onclick(a.get("onclick"))
         if not idx or idx in seen:
             continue
         seen.add(idx)
         title = clean_spaces(' '.join(cell.stripped_strings))
-        rows.append({"idx": idx, "title": title})
+        date_td = tr.select_one("td:nth-child(4)")
+        date = clean_spaces(date_td.text) if date_td else ""
+        rows.append({"idx": idx, "title": title, "date": date})
     return rows
 
 def fetch_detail_body_and_soup(sess, cookies, source_name, idx, page_for_context, verify_ssl):
@@ -213,7 +220,6 @@ if st.sidebar.button("초기화"):
     S.results = []
     S.config = {}
     S.ran = False
-    # 준비된 파일도 모두 제거
     for k in list(S.keys()):
         if k.startswith(("blob_", "name_")):
             del S[k]
@@ -225,7 +231,6 @@ st.caption(f"대상: {cfg['source_name']} | 페이지: {cfg['start_page']} ~ {cf
 
 # ───────────── 콜백: 첨부 준비 ─────────────
 def prep_file(idx: str, ai: int, url: str):
-    """버튼 콜백: 파일을 받아 세션 상태에 저장. 리런 후 바로 download_button 표시"""
     try:
         sess_local = make_session(S.config["headers"], S.config["verify_ssl"])
         ref = build_g_archive_detail_referer(idx) if S.config["source_name"] == "교육기관발표자료" else ENDPOINTS[S.config["source_name"]]["referer"]
@@ -235,13 +240,12 @@ def prep_file(idx: str, ai: int, url: str):
     except Exception as e:
         st.warning(f"다운로드 준비 실패: {e}")
 
-# ───────────── 한 건 렌더(즉시 출력) ─────────────
+# ───────────── 한 건 렌더 ─────────────
 def render_one_row(row: dict, cfg: dict):
-    idx, title, body = row["idx"], row["title"], row["body"]
-    with st.expander(f"[{idx}] {title}", expanded=False):
+    idx, title, body, date = row["idx"], row["title"], row["body"], row.get("date","")
+    with st.expander(f"[{idx}] {title} ({date})", expanded=False):
         st.markdown(body.replace("\n", "  \n"))
 
-        # 교육기관발표자료: 첨부 버튼들
         if cfg["source_name"] == "교육기관발표자료":
             atts = row.get("attachments") or []
             if not atts:
@@ -254,7 +258,6 @@ def render_one_row(row: dict, cfg: dict):
                 key_blob = f"blob_{idx}_{ai}"
                 key_name = f"name_{idx}_{ai}"
 
-                # 1) prefetch 성공 → 바로 다운로드 버튼
                 if cfg.get("prefetch") and prefetched and ai < len(prefetched) and prefetched[ai].get("ok"):
                     fname = S.get(key_name, prefetched[ai]["name"])
                     st.download_button(
@@ -266,7 +269,6 @@ def render_one_row(row: dict, cfg: dict):
                     )
                     continue
 
-                # 2) 미리받기 미사용/실패 → 준비 버튼(콜백) + 준비되어 있으면 다운로드 버튼
                 cols = st.columns([2, 6])
                 with cols[0]:
                     st.button(
@@ -285,7 +287,7 @@ def render_one_row(row: dict, cfg: dict):
                             key=f"dl_ready_{idx}_{ai}"
                         )
 
-# ───────────── 크롤 실행: 페이지/항목별 즉시 렌더 ─────────────
+# ───────────── 실행 ─────────────
 if S.ran and S.config:
     cookies = S.config["cookies"]; headers = S.config["headers"]
     verify_ssl = S.config["verify_ssl"]; delay = S.config["delay_sec"]
@@ -305,11 +307,10 @@ if S.ran and S.config:
             continue
 
         for it in items:
-            idx, title = it["idx"], it["title"]
+            idx, title, date = it["idx"], it["title"], it.get("date","")
             body, soup_detail = fetch_detail_body_and_soup(sess, cookies, S.config["source_name"], idx, page, verify_ssl)
-            row = {"idx": idx, "title": title, "body": body}
+            row = {"idx": idx, "title": title, "body": body, "date": date}
 
-            # 교육기관발표자료: 첨부/미리받기
             if S.config["source_name"] == "교육기관발표자료":
                 attaches = find_attachments_from_g_archive(soup_detail)
                 row["attachments"] = attaches
@@ -318,7 +319,6 @@ if S.ran and S.config:
                     row["prefetched"] = []
                     for ai, au in enumerate(attaches):
                         try:
-                            # prefetch 시 세션에 저장 → 바로 버튼 렌더
                             fname, data = download_binary(sess, cookies, au, verify_ssl, referer=build_g_archive_detail_referer(idx))
                             if data.getbuffer().nbytes > limit_bytes:
                                 row["prefetched"].append({"ok": False, "reason": "limit", "name": fname})
@@ -329,7 +329,6 @@ if S.ran and S.config:
                         except Exception as e:
                             row["prefetched"].append({"ok": False, "reason": str(e)})
 
-            # 즉시 렌더 + 누적
             render_one_row(row, S.config)
             S.results.append(row)
             time.sleep(delay)
@@ -339,39 +338,6 @@ if S.ran and S.config:
         time.sleep(delay)
 
     st.success(f"총 {len(S.results)}건 수집 완료")
-    st.dataframe([{"idx": r["idx"], "title": r["title"]} for r in S.results], use_container_width=True)
+    st.dataframe([{"idx": r["idx"], "title": r["title"], "date": r.get("date","")} for r in S.results], use_container_width=True)
 
-    # 선택 다운로드 섹션 (교육기관발표자료)
-    if S.config["source_name"] == "교육기관발표자료" and S.config.get("want_download", False):
-        st.markdown("---"); st.subheader("첨부파일 선택 다운로드")
-        with_attach = [r for r in S.results if r.get("attachments")]
-        if not with_attach:
-            st.info("첨부가 있는 게시물이 없습니다.")
-        else:
-            options = [f"{r['idx']} | {r['title']}" for r in with_attach]
-            selected_items = st.multiselect("다운로드할 게시물 선택", options, default=[])
-            exts = [e.strip().lower() for e in (S.config.get("ext_filter") or "").split(",") if e.strip()]
-            if st.button("선택 항목 다운로드 준비"):
-                for opt in selected_items:
-                    idx_str = opt.split("|", 1)[0].strip()
-                    target = next((r for r in with_attach if str(r["idx"]) == idx_str), None)
-                    if not target: 
-                        continue
-                    attaches = target.get("attachments", [])
-                    for ai, au in enumerate(attaches):
-                        if exts:
-                            path = urlparse(au).path.lower()
-                            if not any(path.endswith("." + x) for x in exts):
-                                continue
-                        try:
-                            sess_local = make_session(headers, verify_ssl)
-                            fname, data = download_binary(sess_local, cookies, au, verify_ssl, referer=build_g_archive_detail_referer(idx_str))
-                            st.download_button(
-                                label=f"📥 {fname}",
-                                data=data,
-                                file_name=fname,
-                                mime="application/octet-stream",
-                                key=f"bulk_dl_{idx_str}_{ai}"
-                            )
-                        except Exception as e:
-                            st.warning(f"다운로드 실패: {e}")
+
